@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchDaemon：随开机启动 scamper 常驻 daemon。
+
+  监听路径为 scamper-client-go 的默认 socket：/var/run/scamper/scamper.sock。
+
+  安装（需 root）：
+    sudo sh scripts/scamperd/install.sh
+  卸载：
+    sudo sh scripts/scamperd/uninstall.sh
+
+  说明：
+    - scamper 需要 root（macOS 的 /dev/bpf* 权限）。
+    - Umask=0 让 control socket 以 0777 创建，非 root 的 Go 进程才能 connect；
+      socket 父目录显式 chmod 0755，避免可被他人写入（symlink 攻击面）。
+    - 不要加 -D：launchd 需要进程前台常驻。若 scamper 自行 daemonize，launchd 会
+      误判进程已退出并（配合 KeepAlive）反复拉起，产生多个 daemon。
+    - 启动前清掉上次异常退出可能残留的 socket，否则 bind 会失败。
+    - -w 100   daemon 的 active task 窗口（按你的要求设置）。
+      -p 10000 全局发包速率上限，单位 packets/second。
+      -e        写 pidfile，便于运维排查。
+    - 提醒：-w 是 daemon 侧窗口，与 trace 命令里的 -w（每 probe 等待秒数）无关；
+      客户端 WithConcurrency 建议取接近该窗口的值。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.scamper-client-go.scamperd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>mkdir -p /var/run/scamper &amp;&amp; chmod 0755 /var/run/scamper &amp;&amp; rm -f /var/run/scamper/scamper.sock &amp;&amp; exec /opt/homebrew/bin/scamper -U /var/run/scamper/scamper.sock -w 100 -p 10000 -e /var/run/scamper/scamper.pid</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>Umask</key>
+  <integer>0</integer>
+  <key>StandardOutPath</key>
+  <string>/var/log/scamper-client-go.scamperd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/scamper-client-go.scamperd.log</string>
+</dict>
+</plist>

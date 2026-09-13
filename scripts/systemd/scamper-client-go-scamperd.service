@@ -1,0 +1,66 @@
+# scamper-client-go — scamper control-socket daemon (systemd)
+#
+# 安装：
+#   sudo sh scripts/systemd/install.sh
+# 卸载：
+#   sudo sh scripts/systemd/uninstall.sh
+#
+# 说明：
+#   - scamper 需要 raw socket 权限；最简做法是直接以 root 运行。
+#   - RuntimeDirectory=scamper 由 systemd 创建 /run/scamper（停止时自动清理）。
+#     在 systemd 系统上 /var/run 是指向 /run 的符号链接，因此该路径等价于
+#     SDK 的默认值 /var/run/scamper/scamper.sock。
+#   - UMask=0000 让 control socket 以 0777 创建，非 root 的 Go 进程才能 connect。
+#   - 不要加 -D：systemd 需要进程在前台常驻（Type=simple）；若 scamper 自行
+#     daemonize，systemd 会误判进程退出并（配合 Restart=always）反复拉起。
+#   - 启动前删除上一次异常退出可能残留的 socket，否则 bind 会失败。
+#   - -w 100 是 daemon 的 active task 窗口；-p 10000 是全局发包速率上限。
+#     注意 -w 与 trace 命令里的 -w（每 probe 等待秒数）无关；客户端
+#     WithConcurrency 建议取接近该窗口的值。
+#
+# 非 root 运行（可选，更安全）：
+#   1) sudo setcap cap_net_raw,cap_net_admin=eip /usr/local/bin/scamper
+#   2) 把 User=/Group= 改为专用账号，并加入下面注释中的 AmbientCapabilities
+#      与 CapabilityBoundingSet，同时确保该账号对 /run/scamper 可写。
+
+[Unit]
+Description=scamper daemon for scamper-client-go (Unix control socket)
+Documentation=man:scamper(1)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# 创建 /run/scamper（= /var/run/scamper），停止时自动清理
+RuntimeDirectory=scamper
+RuntimeDirectoryMode=0755
+
+# 清理上次异常退出可能残留的 socket
+ExecStartPre=-/bin/rm -f /run/scamper/scamper.sock
+
+# 二进制路径由 install.sh 自动探测并替换
+ExecStart=/usr/local/bin/scamper -U /run/scamper/scamper.sock -w 100 -p 10000
+
+Restart=always
+RestartSec=2
+
+# control socket 需 0777 供非 root 客户端连接
+UMask=0000
+
+# 仅允许必要的地址族：AF_PACKET(datalink/BPF)、AF_NETLINK(路由)、AF_UNIX(control socket)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
+# --- 可选加固（按需启用；若 scamper 特权分离异常，先注释掉再排查）---
+#NoNewPrivileges=true
+#PrivateTmp=true
+#ProtectHome=true
+#ProtectSystem=full
+#ReadWritePaths=/run/scamper
+#AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+#CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Build artifacts
+/bin/
+*.test
+*.out
+
+# Coverage
+coverage.txt
+coverage.html
+
+# Benchmark reports / raw data
+/benchmark/
+
+# Local benchmark harness (personal test code, not part of the SDK)
+/tmp-bench*/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
