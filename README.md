@@ -64,7 +64,6 @@ fmt.Println(len(res.Hops), res.StopReason, res.Duration)
 ```go
 c, err := scamper.NewSocketClient(
     scamper.WithSocketPath("/var/run/scamper/scamper.sock"),
-    scamper.WithMaxInflight(64),
 )
 if err != nil {
     log.Fatal(err) // 连接/attach 失败会 fail-fast
@@ -150,14 +149,70 @@ type Hop struct {
 `Build()` 返回 `[]string` argv（不含 `trace` 与 target）；`Validate()` 在提交前发现
 非法组合，返回可被 `errors.Is(err, scamper.ErrInvalidConfig)` 判定的错误。
 
-## 并发与 daemon 前置说明
+## 配置选项
 
-- 并发只在 socket 模式有意义。`WithConcurrency` / `WithMaxInflight` **只是本地提交上限**。
-- daemon 的 `-w`（active task 窗口）与 `-p`（PPS）由用户配置；若本地并发远大于 daemon
-  窗口，任务只会在 daemon 侧排队，不会更快，过高并发反而可能降低测量质量。
-- 建议 `WithConcurrency` 取接近 daemon 窗口的值。
-- 超时/取消时 SDK 会尽力发送 `halt <id>`，避免占用 daemon 窗口。
-- legacy 模式每个目标启动一个进程，默认进程池并发为 8，开销明显高于 socket。
+API 采用 functional options，分三层且类型相互独立，避免误用：`Trace` 只接受
+`TraceOption`，`TraceBatch` 只接受 `BatchOption`。
+
+### 客户端构造（`ClientOption`）
+
+| 选项 | 作用 | 默认 |
+|------|------|------|
+| `WithSocketPath(path)` | socket 模式：daemon control socket 路径 | `DefaultSocketPath`（`/var/run/scamper/scamper.sock`） |
+| `WithBinary(path)` | legacy 模式：scamper 可执行文件路径 | 在 `PATH` 中查找 `scamper` |
+| `WithDialTimeout(d)` | socket 模式：建连与 attach 握手的超时 | 5s |
+| `WithReconnectPolicy(p)` | socket 模式：断线重连指数退避（`MinBackoff`/`MaxBackoff`/`Multiplier`/`Jitter`） | 1s→30s、×2、开启抖动 |
+| `WithDefaultTraceConfig(c)` | 客户端默认 `TraceConfig`，可被单次调用覆盖 | 不设置 |
+| `WithLogger(l)` | 结构化日志（`*slog.Logger`） | 静默 |
+| `WithMaxInflight(n)` | socket 模式：同一 Client 上同时在途的任务上限（信号量）；`<=0` 表示不限制 | 64 |
+| `WithMetrics(sink)` | 指标回调（提交/完成/失败/重连/队列深度） | no-op |
+| `WithHealthCheck(d)` | 预留项：scamper attach 模式不支持交互式命令，无法安全地主动探测，当前不改变行为 | 0 |
+
+### 单次调用（`TraceOption`）
+
+| 选项 | 作用 | 默认 |
+|------|------|------|
+| `WithTraceConfig(c)` | 覆盖客户端默认 `TraceConfig` | 客户端默认 |
+| `WithTimeout(d)` | 单目标超时；超时会中止该目标并返回 `*TimeoutError` | 仅受 `ctx` 约束 |
+| `WithRetry(n)` | 可重试错误的重试次数（由 `IsRetryable` 判定） | 0（不重试） |
+| `WithMetadata(m)` | 透传业务信息，合并进结果的 `Metadata`（同名键用户优先） | 无 |
+
+### 批量调用（`BatchOption`）
+
+| 选项 | 作用 | 默认 |
+|------|------|------|
+| `WithConcurrency(n)` | worker 并发上限 | socket 16 / legacy 8 |
+| `WithBatchTimeout(d)` | 每个目标的超时 | 仅受 `ctx` 约束 |
+| `WithBatchRetry(n)` | 每个目标独立的重试次数 | 0（不重试） |
+| `WithBatchTraceConfig(c)` | 批量覆盖 `TraceConfig` | 客户端默认 |
+| `WithBatchMetadata(m)` | 批量透传元数据 | 无 |
+| `WithStopOnError(b)` | 首个不可重试错误是否中止剩余任务 | `false`（跑完整批） |
+| `WithProgress(fn)` | 结果落地回调 `fn(done, total int)`；可能被并发调用 | 无 |
+| `WithQueueSize(n)` | 调度队列容量；实际容量为 `max(n, concurrency)` | 等于并发数 |
+| `WithDropOnBackpressure(b)` | 队列满时快速失败（对应目标返回 `ErrBatchStopped`），而非阻塞提交 | `false`（阻塞形成背压） |
+
+## 并发模型与 daemon 窗口
+
+`TraceBatch` 的每个目标依次经过：提交端 → **有界队列** → **worker** → 单 writer/单连接 → daemon。
+
+本地有三个含义不同的闸门：
+
+| 参数 | 控制什么 | 说明 |
+|------|----------|------|
+| `WithConcurrency` | 同时执行任务的 goroutine 数 | worker pool 大小 |
+| `WithMaxInflight` | 同一 Client 上同时“在途”的任务数 | 已提交 daemon、等待结果；跨多次并发调用共享 |
+| `WithQueueSize` | 待处理任务缓冲 | 满时默认阻塞提交（背压），可改为快速失败 |
+
+daemon 侧由用户配置：`-w` 是可同时进行的 active task 窗口，`-p` 是全局发包速率。
+因此**实际并发 ≈ min(WithConcurrency, WithMaxInflight, daemon -w)**：
+
+- 把本地参数设得高于 daemon 窗口不会更快，多余任务只会在 daemon 侧排队。
+- 高并发突发还可能因上游对 ICMP/UDP 的限速而降低响应捕获率（测量质量下降）；
+  实测 64–128 并发在吞吐与保真度之间更均衡。
+- 建议 `WithConcurrency` 取接近 daemon 窗口（本仓库附带 daemon 为 `-w 100`，常用 64–100），
+  并保证 `WithMaxInflight ≥ WithConcurrency`。
+- 超时/取消时 SDK 会尽力向 daemon 发送 `halt <id>`，避免长期占用窗口。
+- legacy 模式没有 daemon 窗口：每个目标一个进程，默认进程池为 8，开销明显高于 socket。
 
 ## 错误模型
 
